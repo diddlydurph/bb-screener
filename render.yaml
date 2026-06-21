@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: bb-screener
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --workers 1 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: CHECK_INTERVAL
+        value: "900"
