@@ -1,10 +1,11 @@
 """
-BB Touch Screener
-------------------
+BB Touch Screener — Intraday
+------------------------------
 Runs every 15 minutes during US market hours.
-Checks all watchlist tickers against their lower Bollinger Band (20, 2).
-Filters out earnings-driven drops and gap downs.
-Sends alerts to both Telegram and Discord.
+Checks LIVE price against lower BB calculated from daily closes.
+Fires alert as soon as price touches lower BB intraday.
+Filters: gap down >3%, earnings within 3 days, volume spike warning.
+Sends alerts to Telegram and Discord.
 """
 
 import os
@@ -13,7 +14,7 @@ import time
 import threading
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -24,14 +25,13 @@ TG_CHAT_ID      = os.environ.get("TG_CHAT_ID",   "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "900"))  # 15 min
 
-# Filter settings
-GAP_DOWN_THRESHOLD    = float(os.environ.get("GAP_DOWN_THRESHOLD",    "3.0"))   # % gap down from prev close
-EARNINGS_WINDOW_DAYS  = int(os.environ.get("EARNINGS_WINDOW_DAYS",    "3"))     # days after earnings to suppress
-VOLUME_SPIKE_MULTIPLE = float(os.environ.get("VOLUME_SPIKE_MULTIPLE", "2.5"))   # x avg volume = suspicious
+GAP_DOWN_THRESHOLD    = float(os.environ.get("GAP_DOWN_THRESHOLD",    "3.0"))
+EARNINGS_WINDOW_DAYS  = int(os.environ.get("EARNINGS_WINDOW_DAYS",    "3"))
+VOLUME_SPIKE_MULTIPLE = float(os.environ.get("VOLUME_SPIKE_MULTIPLE", "2.5"))
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 WATCHLIST = [
-    "NXT", "SPY", "QQQ", "HOOD", "PLTR", "SOFI", "KTOS", "IREN",
+    "SPY", "QQQ", "HOOD", "PLTR", "SOFI", "KTOS", "IREN",
     "INOD", "GLW", "AVGO", "IBRX", "IBM", "DRAM", "CLS", "CCJ",
     "COO", "WDC", "STX", "SNDK", "CRDO", "VRT", "CDE", "MU",
     "AA", "ADI", "AMAT", "NVDA", "AMD", "AMZN", "APH", "APP",
@@ -42,15 +42,14 @@ WATCHLIST = [
 WATCHLIST = list(dict.fromkeys(WATCHLIST))
 
 # ── State ─────────────────────────────────────────────────────────────────────
-alerted_today   = set()
-last_alert_date = None
+alerted_today    = set()
+last_alert_date  = None
 status_cache = {
-    "last_run":      None,
-    "next_run":      None,
-    "alerts_today":  [],
+    "last_run":       None,
+    "alerts_today":   [],
     "filtered_today": [],
-    "errors":        [],
-    "market_open":   False,
+    "errors":         [],
+    "market_open":    False,
 }
 
 
@@ -99,8 +98,9 @@ def is_market_open() -> bool:
     return open_ <= now_et <= close_
 
 
-# ── Price data ────────────────────────────────────────────────────────────────
-def get_daily_prices(ticker: str, period: int = 30):
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def get_daily_data(ticker: str, period: int = 30):
+    """Fetch historical daily OHLCV — used for BB calculation."""
     try:
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -120,19 +120,60 @@ def get_daily_prices(ticker: str, period: int = 30):
         }).dropna()
         return df
     except Exception as e:
-        print(f"[{ticker}] Price fetch error: {e}")
+        print(f"[{ticker}] Daily data error: {e}")
         return None
 
 
-# ── Earnings dates ────────────────────────────────────────────────────────────
-def get_recent_earnings(ticker: str) -> list[str]:
-    """
-    Returns list of recent earnings dates (YYYY-MM-DD strings)
-    from Yahoo Finance earnings history.
-    """
+def get_live_price(ticker: str) -> dict | None:
+    """Fetch current live quote — price, day low, day volume."""
     try:
-        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsHistory"
-        r   = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
+        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = r.json()
+        res  = data["chart"]["result"][0]
+        meta = res["meta"]
+        return {
+            "price":      meta.get("regularMarketPrice"),
+            "day_low":    meta.get("regularMarketDayLow"),
+            "day_open":   meta.get("regularMarketOpen"),
+            "volume":     meta.get("regularMarketVolume"),
+            "prev_close": meta.get("chartPreviousClose") or meta.get("previousClose"),
+        }
+    except Exception as e:
+        print(f"[{ticker}] Live price error: {e}")
+        return None
+
+
+# ── Bollinger Bands ───────────────────────────────────────────────────────────
+def calculate_bb(df, length: int = 20, std: float = 2.0) -> dict | None:
+    """Calculate BB from historical daily closes. Returns lower band + context."""
+    if len(df) < length:
+        return None
+    hist    = df.iloc[:-1] if len(df) > 1 else df
+    close   = hist["close"]
+    basis   = close.rolling(length).mean()
+    stddev  = close.rolling(length).std()
+    lower   = basis - std * stddev
+    avg_vol = hist["volume"].rolling(length).mean().iloc[-1]
+    return {
+        "lower":   round(lower.iloc[-1],  2),
+        "basis":   round(basis.iloc[-1],  2),
+        "avg_vol": avg_vol,
+    }
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
+def check_gap_down(day_open: float, prev_close: float) -> tuple[bool, float]:
+    if not prev_close or prev_close == 0:
+        return False, 0
+    gap_pct = (day_open - prev_close) / prev_close * 100
+    return gap_pct <= -GAP_DOWN_THRESHOLD, round(gap_pct, 2)
+
+
+def check_earnings(ticker: str) -> tuple[bool, str | None]:
+    try:
+        url  = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsHistory"
+        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         data = r.json()
         history = (
             data.get("quoteSummary", {})
@@ -140,65 +181,25 @@ def get_recent_earnings(ticker: str) -> list[str]:
                 .get("earningsHistory", {})
                 .get("history", [])
         )
-        dates = []
+        today = datetime.utcnow().date()
         for item in history:
             raw = item.get("quarter", {}).get("fmt")
             if raw:
-                dates.append(raw)
-        return dates
+                try:
+                    d = datetime.strptime(raw, "%Y-%m-%d").date()
+                    if 0 <= (today - d).days <= EARNINGS_WINDOW_DAYS:
+                        return True, raw
+                except Exception:
+                    continue
     except Exception as e:
-        print(f"[{ticker}] Earnings fetch error: {e}")
-        return []
-
-
-# ── Bollinger Bands ───────────────────────────────────────────────────────────
-def calculate_bb(df, length: int = 20, std: float = 2.0):
-    if len(df) < length:
-        return None
-    close  = df["close"]
-    basis  = close.rolling(length).mean()
-    stddev = close.rolling(length).std()
-    lower  = basis - std * stddev
-    avg_vol = df["volume"].rolling(length).mean().iloc[-1]
-    return {
-        "lower":   round(lower.iloc[-1], 2),
-        "close":   round(close.iloc[-1], 2),
-        "low":     round(df["low"].iloc[-1], 2),
-        "open":    round(df["open"].iloc[-1], 2),
-        "prev_close": round(close.iloc[-2], 2),
-        "volume":  df["volume"].iloc[-1],
-        "avg_vol": avg_vol,
-        "pct":     round((close.iloc[-1] - lower.iloc[-1]) / lower.iloc[-1] * 100, 2),
-    }
-
-
-# ── Filters ───────────────────────────────────────────────────────────────────
-def check_gap_down(bb: dict) -> tuple[bool, float]:
-    """Returns (is_gap_down, gap_pct)."""
-    gap_pct = (bb["open"] - bb["prev_close"]) / bb["prev_close"] * 100
-    return gap_pct <= -GAP_DOWN_THRESHOLD, round(gap_pct, 2)
-
-
-def check_earnings(ticker: str) -> tuple[bool, str | None]:
-    """Returns (near_earnings, earnings_date_str)."""
-    dates = get_recent_earnings(ticker)
-    today = datetime.utcnow().date()
-    for d_str in dates:
-        try:
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-            days_since = (today - d).days
-            if 0 <= days_since <= EARNINGS_WINDOW_DAYS:
-                return True, d_str
-        except Exception:
-            continue
+        print(f"[{ticker}] Earnings check error: {e}")
     return False, None
 
 
-def check_volume_spike(bb: dict) -> tuple[bool, float]:
-    """Returns (is_spike, volume_multiple)."""
-    if not bb["avg_vol"] or bb["avg_vol"] == 0:
+def check_volume_spike(volume: float, avg_vol: float) -> tuple[bool, float]:
+    if not avg_vol or avg_vol == 0:
         return False, 0
-    multiple = bb["volume"] / bb["avg_vol"]
+    multiple = volume / avg_vol
     return multiple >= VOLUME_SPIKE_MULTIPLE, round(multiple, 1)
 
 
@@ -214,36 +215,45 @@ def run_screener():
         status_cache["filtered_today"] = []
 
     now_str = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-    print(f"\n[{now_str}] Scanning {len(WATCHLIST)} tickers…")
+    print(f"\n[{now_str}] Scanning {len(WATCHLIST)} tickers (intraday)…")
 
     touches  = []
     filtered = []
     errors   = []
 
     for ticker in WATCHLIST:
+        if ticker in alerted_today:
+            time.sleep(0.1)
+            continue
+
         try:
-            df = get_daily_prices(ticker, period=30)
-            if df is None or len(df) < 20:
+            df = get_daily_data(ticker, period=32)
+            if df is None or len(df) < 21:
                 continue
 
             bb = calculate_bb(df)
             if bb is None:
                 continue
 
-            touched = bb["low"] <= bb["lower"]
+            live = get_live_price(ticker)
+            if live is None or live["price"] is None:
+                continue
+
+            price      = live["price"]
+            day_low    = live["day_low"]
+            day_open   = live["day_open"]
+            volume     = live["volume"] or 0
+            prev_close = live["prev_close"]
+
+            touched = price <= bb["lower"] or (day_low and day_low <= bb["lower"])
+
+            print(f"  {ticker:6s} price={price:8.2f}  lower={bb['lower']:8.2f}  {'⚡ TOUCH' if touched else ''}")
+
             if not touched:
-                print(f"  {ticker:6s} close={bb['close']:8.2f}  lower={bb['lower']:8.2f}  low={bb['low']:8.2f}")
                 time.sleep(0.3)
                 continue
 
-            if ticker in alerted_today:
-                time.sleep(0.3)
-                continue
-
-            print(f"  {ticker:6s} ⚡ TOUCH — running filters…")
-
-            # ── Filter 1: Gap down ──
-            is_gap, gap_pct = check_gap_down(bb)
+            is_gap, gap_pct = check_gap_down(day_open, prev_close)
             if is_gap:
                 reason = f"gap down {gap_pct}% (threshold: -{GAP_DOWN_THRESHOLD}%)"
                 print(f"    ❌ Filtered — {reason}")
@@ -253,7 +263,6 @@ def run_screener():
                 time.sleep(0.3)
                 continue
 
-            # ── Filter 2: Earnings proximity ──
             near_earnings, earn_date = check_earnings(ticker)
             if near_earnings:
                 reason = f"within {EARNINGS_WINDOW_DAYS}d of earnings ({earn_date})"
@@ -264,11 +273,18 @@ def run_screener():
                 time.sleep(0.3)
                 continue
 
-            # ── Filter 3: Volume spike (warn but don't suppress) ──
-            is_spike, vol_multiple = check_volume_spike(bb)
-            vol_warning = f" ⚠️ Volume {vol_multiple}x avg" if is_spike else ""
+            is_spike, vol_multiple = check_volume_spike(volume, bb["avg_vol"])
+            vol_warning = f" ⚠️ Vol {vol_multiple}x avg" if is_spike else ""
+            pct_from_bb = round((price - bb["lower"]) / bb["lower"] * 100, 2)
 
-            touches.append({**bb, "ticker": ticker, "vol_warning": vol_warning, "gap_pct": gap_pct})
+            touches.append({
+                "ticker":      ticker,
+                "price":       price,
+                "lower":       bb["lower"],
+                "pct":         pct_from_bb,
+                "gap_pct":     gap_pct,
+                "vol_warning": vol_warning,
+            })
             alerted_today.add(ticker)
 
         except Exception as e:
@@ -277,36 +293,28 @@ def run_screener():
 
         time.sleep(0.3)
 
-    # ── Send clean alerts ──
     for t in touches:
         msg = (
-            f"🔔 <b>Lower BB Touch</b>\n\n"
-            f"<b>{t['ticker']}</b>{t['vol_warning']}\n\n"
-            f"💰 Close:     <code>{t['close']}</code>\n"
-            f"📉 Low:       <code>{t['low']}</code>\n"
+            f"🔔 <b>Lower BB Touch</b>{t['vol_warning']}\n\n"
+            f"<b>{t['ticker']}</b>\n\n"
+            f"💰 Price:     <code>{t['price']}</code>\n"
             f"📊 Lower BB:  <code>{t['lower']}</code>\n"
             f"📏 % from BB: <code>{t['pct']:+.2f}%</code>\n"
-            f"📈 Gap from prev close: <code>{t['gap_pct']:+.2f}%</code>\n"
+            f"📈 Day gap:   <code>{t['gap_pct']:+.2f}%</code>\n"
             f"🕐 {now_str}\n\n"
             f"✅ Passed earnings &amp; gap filters\n"
             f"⚡ Potential LEAPS entry on <b>{t['ticker']}</b>"
         )
         send_alert(msg)
-        status_cache["alerts_today"].append({"ticker": t["ticker"], "time": now_str})
-        print(f"  ✅ Alert sent for {t['ticker']}")
+        status_cache["alerts_today"].append({"ticker": t["ticker"], "time": now_str, "price": t["price"]})
+        print(f"  ✅ Alert sent for {t['ticker']} @ {t['price']}")
 
-    # ── Send filtered summary (one message, not per ticker) ──
     if filtered:
-        names = ", ".join(f["ticker"] for f in filtered)
         reasons = "\n".join(f"• {f['ticker']}: {f['reason']}" for f in filtered)
-        msg = (
-            f"🚫 <b>BB Touch — Filtered Out</b>\n\n"
-            f"The following touched the lower BB but were suppressed:\n\n"
-            f"{reasons}\n\n"
-            f"<i>Filtered due to earnings proximity or gap down</i>"
+        send_alert(
+            f"🚫 <b>BB Touch — Filtered Out</b>\n\n{reasons}\n\n"
+            f"<i>Suppressed: earnings proximity or gap down</i>"
         )
-        send_alert(msg)
-        print(f"  🚫 Filtered summary sent: {names}")
 
     if not touches and not filtered:
         print("  No BB touches this run.")
@@ -335,16 +343,15 @@ def screener_loop():
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    filtered_count = len(status_cache["filtered_today"])
     return (
-        "<h2>BB Screener</h2>"
-        "<p>Scanning every 15 min during US market hours (09:30–16:00 ET).</p>"
+        "<h2>BB Screener — Intraday</h2>"
+        "<p>Checks live price vs lower BB every 15 min during market hours.</p>"
         "<ul>"
         f"<li>Watching <b>{len(WATCHLIST)} tickers</b></li>"
         f"<li>Last run: <b>{status_cache['last_run'] or 'not yet'}</b></li>"
         f"<li>Market open: <b>{status_cache['market_open']}</b></li>"
-        f"<li>Clean alerts today: <b>{len(status_cache['alerts_today'])}</b></li>"
-        f"<li>Filtered out today: <b>{filtered_count}</b> (earnings/gap down)</li>"
+        f"<li>Alerts today: <b>{len(status_cache['alerts_today'])}</b></li>"
+        f"<li>Filtered today: <b>{len(status_cache['filtered_today'])}</b></li>"
         "</ul>"
         "<p><a href='/status'>Status JSON</a> · "
         "<a href='/run'>Force scan</a> · "
@@ -365,13 +372,12 @@ def force_run():
 
 @app.route("/test")
 def test():
-    msg = (
-        f"✅ <b>BB Screener Active</b>\n\n"
-        f"Watching <b>{len(WATCHLIST)} tickers</b> for lower BB touches.\n"
-        f"Filters: gap down &gt;{GAP_DOWN_THRESHOLD}%, earnings within {EARNINGS_WINDOW_DAYS} days, volume spike warning at {VOLUME_SPIKE_MULTIPLE}x avg.\n"
-        "Alerts fire to Telegram + Discord."
+    send_alert(
+        f"✅ <b>BB Screener Active — Intraday Mode</b>\n\n"
+        f"Watching <b>{len(WATCHLIST)} tickers</b>.\n"
+        f"Fires alert as soon as live price touches lower BB.\n"
+        f"Scans every 15 min during market hours (09:30–16:00 ET)."
     )
-    send_alert(msg)
     return jsonify({"status": "ok"}), 200
 
 
