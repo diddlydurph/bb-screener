@@ -358,7 +358,7 @@ def run_screener():
             f"📏 % from BB: <code>{t['pct']:+.2f}%</code>\n"
             f"📈 Day gap:   <code>{t['gap_pct']:+.2f}%</code>\n"
             f"🕐 {now_str}\n\n"
-            f"✅ Passed earnings &amp; gap filters\n"
+            f"✅ Passed earnings & gap filters\n"
             f"⚡ Potential LEAPS entry on <b>{t['ticker']}</b>"
         )
         send_alert(msg)
