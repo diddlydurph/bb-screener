@@ -281,9 +281,9 @@ def run_screener():
 
     # Fetch VIX once per scan
     vix = get_vix()
-    vix_ok = vix is not None and vix > 20
+    vix_ok = vix is not None and vix >= 15
     vix_str = f"{vix:.2f}" if vix else "N/A"
-    print(f"  VIX: {vix_str} — {'✅ above 20' if vix_ok else '❌ below 20'}")
+    print(f"  VIX: {vix_str} — {'✅ above 15' if vix_ok else '❌ below 15'}")
 
     touches  = []
     filtered = []
