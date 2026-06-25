@@ -1,11 +1,12 @@
 """
 BB Touch Screener — Intraday
 ------------------------------
-Runs every 15 minutes during US market hours.
-Checks LIVE price against lower BB calculated from daily closes.
-Yahoo Finance primary, Finnhub fallback for live prices.
-Filters: gap down >3%, earnings within 3 days, volume spike warning.
-Sends alerts to Telegram and Discord.
+Alerts when:
+  ✅ Price touches lower BB (20, 2) intraday
+  ✅ Not a missed earnings drop
+  ✅ VIX above 20
+One alert per ticker per day.
+Sends to Telegram + Discord.
 """
 
 import os
@@ -23,11 +24,8 @@ app = Flask(__name__)
 TG_BOT_TOKEN    = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID      = os.environ.get("TG_CHAT_ID",   "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-FINNHUB_KEY     = os.environ.get("FINNHUB_KEY", "d8ujcq1r01qrt65qv380d8ujcq1r01qrt65qv38g")
+FINNHUB_KEY     = os.environ.get("FINNHUB_KEY", "")
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "900"))
-
-GAP_DOWN_THRESHOLD    = float(os.environ.get("GAP_DOWN_THRESHOLD",    "3.0"))
-EARNINGS_WINDOW_DAYS  = int(os.environ.get("EARNINGS_WINDOW_DAYS",    "3"))
 VOLUME_SPIKE_MULTIPLE = float(os.environ.get("VOLUME_SPIKE_MULTIPLE", "2.5"))
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -109,9 +107,31 @@ def safe_float(val, default=None):
         return default
 
 
+# ── VIX ───────────────────────────────────────────────────────────────────────
+def get_vix() -> float | None:
+    """Fetch current VIX level — try Yahoo first, Finnhub fallback."""
+    try:
+        url  = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d"
+        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = r.json()
+        vix  = safe_float(data["chart"]["result"][0]["meta"].get("regularMarketPrice"))
+        if vix:
+            return vix
+    except Exception:
+        pass
+    try:
+        url  = f"https://finnhub.io/api/v1/quote?symbol=VIX&token={FINNHUB_KEY}"
+        r    = requests.get(url, timeout=10)
+        vix  = safe_float(r.json().get("c"))
+        if vix:
+            return vix
+    except Exception:
+        pass
+    return None
+
+
 # ── Data fetching ─────────────────────────────────────────────────────────────
 def get_daily_data(ticker: str, period: int = 32):
-    """Fetch historical daily OHLCV from Yahoo Finance for BB calculation."""
     try:
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -136,7 +156,6 @@ def get_daily_data(ticker: str, period: int = 32):
 
 
 def get_live_price_yahoo(ticker: str):
-    """Primary: Yahoo Finance live quote."""
     try:
         url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
         r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -148,40 +167,34 @@ def get_live_price_yahoo(ticker: str):
         return {
             "price":      price,
             "day_low":    safe_float(meta.get("regularMarketDayLow")),
-            "day_open":   safe_float(meta.get("regularMarketOpen")),
             "volume":     safe_float(meta.get("regularMarketVolume"), 0),
             "prev_close": safe_float(meta.get("chartPreviousClose") or meta.get("previousClose")),
             "source":     "yahoo",
         }
-    except Exception as e:
-        print(f"[{ticker}] Yahoo live error: {e}")
+    except Exception:
         return None
 
 
 def get_live_price_finnhub(ticker: str):
-    """Fallback: Finnhub live quote."""
     try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}"
-        r   = requests.get(url, timeout=10)
+        url  = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}"
+        r    = requests.get(url, timeout=10)
         data = r.json()
-        price = safe_float(data.get("c"))  # current price
+        price = safe_float(data.get("c"))
         if price is None or price == 0:
             return None
         return {
             "price":      price,
-            "day_low":    safe_float(data.get("l")),   # day low
-            "day_open":   safe_float(data.get("o")),   # day open
-            "volume":     None,                         # not in basic quote
-            "prev_close": safe_float(data.get("pc")),  # previous close
+            "day_low":    safe_float(data.get("l")),
+            "volume":     None,
+            "prev_close": safe_float(data.get("pc")),
             "source":     "finnhub",
         }
-    except Exception as e:
-        print(f"[{ticker}] Finnhub live error: {e}")
+    except Exception:
         return None
 
 
 def get_live_price(ticker: str):
-    """Try Yahoo first, fall back to Finnhub if Yahoo returns None."""
     live = get_live_price_yahoo(ticker)
     if live is not None:
         return live
@@ -210,39 +223,36 @@ def calculate_bb(df, length: int = 20, std: float = 2.0):
     }
 
 
-# ── Filters ───────────────────────────────────────────────────────────────────
-def check_gap_down(day_open, prev_close):
-    day_open   = safe_float(day_open)
-    prev_close = safe_float(prev_close)
-    if day_open is None or prev_close is None or prev_close == 0:
-        return False, 0.0
-    gap_pct = (day_open - prev_close) / prev_close * 100
-    return gap_pct <= -GAP_DOWN_THRESHOLD, round(gap_pct, 2)
-
-
-def check_earnings(ticker: str):
+# ── Earnings miss check ───────────────────────────────────────────────────────
+def check_missed_earnings(ticker: str) -> tuple[bool, str | None]:
+    """
+    Returns (missed_earnings, date_str).
+    True if the most recent earnings report was a miss (actual EPS < estimate)
+    AND it was within the last 3 days.
+    """
     try:
-        url  = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsHistory"
-        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        url  = f"https://finnhub.io/api/v1/stock/earnings?symbol={ticker}&limit=4&token={FINNHUB_KEY}"
+        r    = requests.get(url, timeout=10)
         data = r.json()
-        history = (
-            data.get("quoteSummary", {})
-                .get("result", [{}])[0]
-                .get("earningsHistory", {})
-                .get("history", [])
-        )
+        if not data:
+            return False, None
         today = datetime.utcnow().date()
-        for item in history:
-            raw = item.get("quarter", {}).get("fmt")
-            if raw:
-                try:
-                    d = datetime.strptime(raw, "%Y-%m-%d").date()
-                    if 0 <= (today - d).days <= EARNINGS_WINDOW_DAYS:
-                        return True, raw
-                except Exception:
-                    continue
+        for report in data:
+            period = report.get("period")
+            actual = safe_float(report.get("actual"))
+            est    = safe_float(report.get("estimate"))
+            if not period:
+                continue
+            try:
+                report_date = datetime.strptime(period, "%Y-%m-%d").date()
+                days_since  = (today - report_date).days
+                if 0 <= days_since <= 3:
+                    if actual is not None and est is not None and actual < est:
+                        return True, period
+            except Exception:
+                continue
     except Exception as e:
-        print(f"[{ticker}] Earnings check error: {e}")
+        print(f"[{ticker}] Earnings miss check error: {e}")
     return False, None
 
 
@@ -267,7 +277,13 @@ def run_screener():
         status_cache["filtered_today"] = []
 
     now_str = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-    print(f"\n[{now_str}] Scanning {len(WATCHLIST)} tickers (intraday)…")
+    print(f"\n[{now_str}] Scanning {len(WATCHLIST)} tickers…")
+
+    # Fetch VIX once per scan
+    vix = get_vix()
+    vix_ok = vix is not None and vix > 20
+    vix_str = f"{vix:.2f}" if vix else "N/A"
+    print(f"  VIX: {vix_str} — {'✅ above 20' if vix_ok else '❌ below 20'}")
 
     touches  = []
     filtered = []
@@ -281,24 +297,22 @@ def run_screener():
         try:
             df = get_daily_data(ticker)
             if df is None or len(df) < 21:
-                errors.append(f"{ticker}: insufficient daily data")
+                errors.append(f"{ticker}: insufficient data")
                 continue
 
             bb = calculate_bb(df)
             if bb is None:
-                errors.append(f"{ticker}: BB calculation failed")
+                errors.append(f"{ticker}: BB calc failed")
                 continue
 
             live = get_live_price(ticker)
             if live is None or live["price"] is None:
-                errors.append(f"{ticker}: no live price from Yahoo or Finnhub")
+                errors.append(f"{ticker}: no live price")
                 continue
 
             price      = live["price"]
             day_low    = live["day_low"]
-            day_open   = live["day_open"]
             volume     = live["volume"] or 0
-            prev_close = live["prev_close"]
             source     = live["source"]
 
             touched = price <= bb["lower"] or (day_low is not None and day_low <= bb["lower"])
@@ -309,19 +323,10 @@ def run_screener():
                 time.sleep(0.3)
                 continue
 
-            is_gap, gap_pct = check_gap_down(day_open, prev_close)
-            if is_gap:
-                reason = f"gap down {gap_pct}% (threshold: -{GAP_DOWN_THRESHOLD}%)"
-                print(f"    ❌ Filtered — {reason}")
-                filtered.append({"ticker": ticker, "reason": reason, "time": now_str})
-                status_cache["filtered_today"].append({"ticker": ticker, "reason": reason})
-                alerted_today.add(ticker)
-                time.sleep(0.3)
-                continue
-
-            near_earnings, earn_date = check_earnings(ticker)
-            if near_earnings:
-                reason = f"within {EARNINGS_WINDOW_DAYS}d of earnings ({earn_date})"
+            # ── Check missed earnings ──
+            missed, earn_date = check_missed_earnings(ticker)
+            if missed:
+                reason = f"missed earnings on {earn_date}"
                 print(f"    ❌ Filtered — {reason}")
                 filtered.append({"ticker": ticker, "reason": reason, "time": now_str})
                 status_cache["filtered_today"].append({"ticker": ticker, "reason": reason})
@@ -338,8 +343,10 @@ def run_screener():
                 "price":       price,
                 "lower":       bb["lower"],
                 "pct":         pct_from_bb,
-                "gap_pct":     gap_pct,
                 "vol_warning": vol_warning,
+                "vix":         vix_str,
+                "vix_ok":      vix_ok,
+                "earnings_ok": not missed,
             })
             alerted_today.add(ticker)
 
@@ -350,15 +357,21 @@ def run_screener():
         time.sleep(0.3)
 
     for t in touches:
+        bb_tick      = "✅" 
+        earn_tick    = "✅" if t["earnings_ok"] else "❌"
+        vix_tick     = "✅" if t["vix_ok"] else "❌"
+
         msg = (
             f"🔔 <b>Lower BB Touch</b>{t['vol_warning']}\n\n"
             f"<b>{t['ticker']}</b>\n\n"
-            f"💰 Price:     <code>{t['price']}</code>\n"
-            f"📊 Lower BB:  <code>{t['lower']}</code>\n"
-            f"📏 % from BB: <code>{t['pct']:+.2f}%</code>\n"
-            f"📈 Day gap:   <code>{t['gap_pct']:+.2f}%</code>\n"
+            f"💰 Price:    <code>{t['price']}</code>\n"
+            f"📊 Lower BB: <code>{t['lower']}</code>\n"
+            f"📏 % from BB: <code>{t['pct']:+.2f}%</code>\n\n"
+            f"<b>Criteria</b>\n"
+            f"{bb_tick} Lower BB touched\n"
+            f"{earn_tick} Not a missed earnings drop\n"
+            f"{vix_tick} VIX above 20 (currently {t['vix']})\n\n"
             f"🕐 {now_str}\n\n"
-            f"✅ Passed earnings & gap filters\n"
             f"⚡ Potential LEAPS entry on <b>{t['ticker']}</b>"
         )
         send_alert(msg)
@@ -369,7 +382,7 @@ def run_screener():
         reasons = "\n".join(f"• {f['ticker']}: {f['reason']}" for f in filtered)
         send_alert(
             f"🚫 <b>BB Touch — Filtered Out</b>\n\n{reasons}\n\n"
-            f"<i>Suppressed: earnings proximity or gap down</i>"
+            f"<i>Suppressed: missed earnings</i>"
         )
 
     if not touches and not filtered:
@@ -432,6 +445,7 @@ def test():
         f"✅ <b>BB Screener Active — Intraday Mode</b>\n\n"
         f"Watching <b>{len(WATCHLIST)} tickers</b>.\n"
         f"Yahoo Finance primary, Finnhub fallback.\n"
+        f"Criteria: Lower BB touch + no missed earnings + VIX &gt; 20.\n"
         f"Scans every 15 min during market hours (09:30–16:00 ET)."
     )
     return jsonify({"status": "ok"}), 200
