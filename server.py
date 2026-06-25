@@ -23,7 +23,7 @@ app = Flask(__name__)
 TG_BOT_TOKEN    = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID      = os.environ.get("TG_CHAT_ID",   "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "900"))  # 15 min
+CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "900"))
 
 GAP_DOWN_THRESHOLD    = float(os.environ.get("GAP_DOWN_THRESHOLD",    "3.0"))
 EARNINGS_WINDOW_DAYS  = int(os.environ.get("EARNINGS_WINDOW_DAYS",    "3"))
@@ -42,8 +42,8 @@ WATCHLIST = [
 WATCHLIST = list(dict.fromkeys(WATCHLIST))
 
 # ── State ─────────────────────────────────────────────────────────────────────
-alerted_today    = set()
-last_alert_date  = None
+alerted_today   = set()
+last_alert_date = None
 status_cache = {
     "last_run":       None,
     "alerts_today":   [],
@@ -99,8 +99,17 @@ def is_market_open() -> bool:
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
+def safe_float(val, default=None):
+    """Safely convert a value to float, returning default if None or invalid."""
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_daily_data(ticker: str, period: int = 30):
-    """Fetch historical daily OHLCV — used for BB calculation."""
     try:
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -112,11 +121,11 @@ def get_daily_data(ticker: str, period: int = 30):
         q    = res["indicators"]["quote"][0]
         df   = pd.DataFrame({
             "date":   pd.to_datetime(res["timestamp"], unit="s"),
-            "open":   q["open"],
-            "high":   q["high"],
-            "low":    q["low"],
-            "close":  q["close"],
-            "volume": q["volume"],
+            "open":   [safe_float(v) for v in q["open"]],
+            "high":   [safe_float(v) for v in q["high"]],
+            "low":    [safe_float(v) for v in q["low"]],
+            "close":  [safe_float(v) for v in q["close"]],
+            "volume": [safe_float(v, 0) for v in q["volume"]],
         }).dropna()
         return df
     except Exception as e:
@@ -124,8 +133,7 @@ def get_daily_data(ticker: str, period: int = 30):
         return None
 
 
-def get_live_price(ticker: str) -> dict | None:
-    """Fetch current live quote — price, day low, day volume."""
+def get_live_price(ticker: str):
     try:
         url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
         r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -133,11 +141,11 @@ def get_live_price(ticker: str) -> dict | None:
         res  = data["chart"]["result"][0]
         meta = res["meta"]
         return {
-            "price":      meta.get("regularMarketPrice"),
-            "day_low":    meta.get("regularMarketDayLow"),
-            "day_open":   meta.get("regularMarketOpen"),
-            "volume":     meta.get("regularMarketVolume"),
-            "prev_close": meta.get("chartPreviousClose") or meta.get("previousClose"),
+            "price":      safe_float(meta.get("regularMarketPrice")),
+            "day_low":    safe_float(meta.get("regularMarketDayLow")),
+            "day_open":   safe_float(meta.get("regularMarketOpen")),
+            "volume":     safe_float(meta.get("regularMarketVolume"), 0),
+            "prev_close": safe_float(meta.get("chartPreviousClose") or meta.get("previousClose")),
         }
     except Exception as e:
         print(f"[{ticker}] Live price error: {e}")
@@ -145,8 +153,7 @@ def get_live_price(ticker: str) -> dict | None:
 
 
 # ── Bollinger Bands ───────────────────────────────────────────────────────────
-def calculate_bb(df, length: int = 20, std: float = 2.0) -> dict | None:
-    """Calculate BB from historical daily closes. Returns lower band + context."""
+def calculate_bb(df, length: int = 20, std: float = 2.0):
     if len(df) < length:
         return None
     hist    = df.iloc[:-1] if len(df) > 1 else df
@@ -155,22 +162,28 @@ def calculate_bb(df, length: int = 20, std: float = 2.0) -> dict | None:
     stddev  = close.rolling(length).std()
     lower   = basis - std * stddev
     avg_vol = hist["volume"].rolling(length).mean().iloc[-1]
+    lower_val = safe_float(lower.iloc[-1])
+    basis_val = safe_float(basis.iloc[-1])
+    if lower_val is None or basis_val is None:
+        return None
     return {
-        "lower":   round(lower.iloc[-1],  2),
-        "basis":   round(basis.iloc[-1],  2),
-        "avg_vol": avg_vol,
+        "lower":   round(lower_val, 2),
+        "basis":   round(basis_val, 2),
+        "avg_vol": safe_float(avg_vol, 0),
     }
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
-def check_gap_down(day_open: float, prev_close: float) -> tuple[bool, float]:
-    if not prev_close or prev_close == 0:
-        return False, 0
+def check_gap_down(day_open, prev_close):
+    day_open   = safe_float(day_open)
+    prev_close = safe_float(prev_close)
+    if day_open is None or prev_close is None or prev_close == 0:
+        return False, 0.0
     gap_pct = (day_open - prev_close) / prev_close * 100
     return gap_pct <= -GAP_DOWN_THRESHOLD, round(gap_pct, 2)
 
 
-def check_earnings(ticker: str) -> tuple[bool, str | None]:
+def check_earnings(ticker: str):
     try:
         url  = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsHistory"
         r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -196,9 +209,11 @@ def check_earnings(ticker: str) -> tuple[bool, str | None]:
     return False, None
 
 
-def check_volume_spike(volume: float, avg_vol: float) -> tuple[bool, float]:
-    if not avg_vol or avg_vol == 0:
-        return False, 0
+def check_volume_spike(volume, avg_vol):
+    volume  = safe_float(volume, 0)
+    avg_vol = safe_float(avg_vol, 0)
+    if avg_vol == 0:
+        return False, 0.0
     multiple = volume / avg_vol
     return multiple >= VOLUME_SPIKE_MULTIPLE, round(multiple, 1)
 
@@ -237,6 +252,7 @@ def run_screener():
 
             live = get_live_price(ticker)
             if live is None or live["price"] is None:
+                print(f"  {ticker:6s} — no live price, skipping")
                 continue
 
             price      = live["price"]
@@ -245,7 +261,7 @@ def run_screener():
             volume     = live["volume"] or 0
             prev_close = live["prev_close"]
 
-            touched = price <= bb["lower"] or (day_low and day_low <= bb["lower"])
+            touched = price <= bb["lower"] or (day_low is not None and day_low <= bb["lower"])
 
             print(f"  {ticker:6s} price={price:8.2f}  lower={bb['lower']:8.2f}  {'⚡ TOUCH' if touched else ''}")
 
