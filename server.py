@@ -3,7 +3,7 @@ BB Touch Screener — Intraday
 ------------------------------
 Runs every 15 minutes during US market hours.
 Checks LIVE price against lower BB calculated from daily closes.
-Fires alert as soon as price touches lower BB intraday.
+Yahoo Finance primary, Finnhub fallback for live prices.
 Filters: gap down >3%, earnings within 3 days, volume spike warning.
 Sends alerts to Telegram and Discord.
 """
@@ -23,6 +23,7 @@ app = Flask(__name__)
 TG_BOT_TOKEN    = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID      = os.environ.get("TG_CHAT_ID",   "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+FINNHUB_KEY     = os.environ.get("FINNHUB_KEY", "d8ujcq1r01qrt65qv380d8ujcq1r01qrt65qv38g")
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "900"))
 
 GAP_DOWN_THRESHOLD    = float(os.environ.get("GAP_DOWN_THRESHOLD",    "3.0"))
@@ -98,9 +99,8 @@ def is_market_open() -> bool:
     return open_ <= now_et <= close_
 
 
-# ── Data fetching ─────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def safe_float(val, default=None):
-    """Safely convert a value to float, returning default if None or invalid."""
     try:
         if val is None:
             return default
@@ -109,7 +109,9 @@ def safe_float(val, default=None):
         return default
 
 
-def get_daily_data(ticker: str, period: int = 30):
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def get_daily_data(ticker: str, period: int = 32):
+    """Fetch historical daily OHLCV from Yahoo Finance for BB calculation."""
     try:
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -133,23 +135,58 @@ def get_daily_data(ticker: str, period: int = 30):
         return None
 
 
-def get_live_price(ticker: str):
+def get_live_price_yahoo(ticker: str):
+    """Primary: Yahoo Finance live quote."""
     try:
         url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
         r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         data = r.json()
-        res  = data["chart"]["result"][0]
-        meta = res["meta"]
+        meta = data["chart"]["result"][0]["meta"]
+        price = safe_float(meta.get("regularMarketPrice"))
+        if price is None:
+            return None
         return {
-            "price":      safe_float(meta.get("regularMarketPrice")),
+            "price":      price,
             "day_low":    safe_float(meta.get("regularMarketDayLow")),
             "day_open":   safe_float(meta.get("regularMarketOpen")),
             "volume":     safe_float(meta.get("regularMarketVolume"), 0),
             "prev_close": safe_float(meta.get("chartPreviousClose") or meta.get("previousClose")),
+            "source":     "yahoo",
         }
     except Exception as e:
-        print(f"[{ticker}] Live price error: {e}")
+        print(f"[{ticker}] Yahoo live error: {e}")
         return None
+
+
+def get_live_price_finnhub(ticker: str):
+    """Fallback: Finnhub live quote."""
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}"
+        r   = requests.get(url, timeout=10)
+        data = r.json()
+        price = safe_float(data.get("c"))  # current price
+        if price is None or price == 0:
+            return None
+        return {
+            "price":      price,
+            "day_low":    safe_float(data.get("l")),   # day low
+            "day_open":   safe_float(data.get("o")),   # day open
+            "volume":     None,                         # not in basic quote
+            "prev_close": safe_float(data.get("pc")),  # previous close
+            "source":     "finnhub",
+        }
+    except Exception as e:
+        print(f"[{ticker}] Finnhub live error: {e}")
+        return None
+
+
+def get_live_price(ticker: str):
+    """Try Yahoo first, fall back to Finnhub if Yahoo returns None."""
+    live = get_live_price_yahoo(ticker)
+    if live is not None:
+        return live
+    print(f"[{ticker}] Yahoo failed — trying Finnhub…")
+    return get_live_price_finnhub(ticker)
 
 
 # ── Bollinger Bands ───────────────────────────────────────────────────────────
@@ -212,7 +249,7 @@ def check_earnings(ticker: str):
 def check_volume_spike(volume, avg_vol):
     volume  = safe_float(volume, 0)
     avg_vol = safe_float(avg_vol, 0)
-    if avg_vol == 0:
+    if avg_vol == 0 or volume == 0:
         return False, 0.0
     multiple = volume / avg_vol
     return multiple >= VOLUME_SPIKE_MULTIPLE, round(multiple, 1)
@@ -242,17 +279,19 @@ def run_screener():
             continue
 
         try:
-            df = get_daily_data(ticker, period=32)
+            df = get_daily_data(ticker)
             if df is None or len(df) < 21:
+                errors.append(f"{ticker}: insufficient daily data")
                 continue
 
             bb = calculate_bb(df)
             if bb is None:
+                errors.append(f"{ticker}: BB calculation failed")
                 continue
 
             live = get_live_price(ticker)
             if live is None or live["price"] is None:
-                print(f"  {ticker:6s} — no live price, skipping")
+                errors.append(f"{ticker}: no live price from Yahoo or Finnhub")
                 continue
 
             price      = live["price"]
@@ -260,10 +299,11 @@ def run_screener():
             day_open   = live["day_open"]
             volume     = live["volume"] or 0
             prev_close = live["prev_close"]
+            source     = live["source"]
 
             touched = price <= bb["lower"] or (day_low is not None and day_low <= bb["lower"])
 
-            print(f"  {ticker:6s} price={price:8.2f}  lower={bb['lower']:8.2f}  {'⚡ TOUCH' if touched else ''}")
+            print(f"  {ticker:6s} [{source:7s}] price={price:8.2f}  lower={bb['lower']:8.2f}  {'⚡ TOUCH' if touched else ''}")
 
             if not touched:
                 time.sleep(0.3)
@@ -361,7 +401,7 @@ def screener_loop():
 def index():
     return (
         "<h2>BB Screener — Intraday</h2>"
-        "<p>Checks live price vs lower BB every 15 min during market hours.</p>"
+        "<p>Yahoo Finance + Finnhub fallback. Scans every 15 min during market hours.</p>"
         "<ul>"
         f"<li>Watching <b>{len(WATCHLIST)} tickers</b></li>"
         f"<li>Last run: <b>{status_cache['last_run'] or 'not yet'}</b></li>"
@@ -391,7 +431,7 @@ def test():
     send_alert(
         f"✅ <b>BB Screener Active — Intraday Mode</b>\n\n"
         f"Watching <b>{len(WATCHLIST)} tickers</b>.\n"
-        f"Fires alert as soon as live price touches lower BB.\n"
+        f"Yahoo Finance primary, Finnhub fallback.\n"
         f"Scans every 15 min during market hours (09:30–16:00 ET)."
     )
     return jsonify({"status": "ok"}), 200
