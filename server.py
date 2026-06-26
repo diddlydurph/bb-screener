@@ -4,12 +4,8 @@ BB Touch Screener — Intraday with LEAPS Suggestions
 Alerts when:
   ✅ Price touches lower BB (20, 2) intraday
      (or mid-BB if beta > 2.2)
-  ✅ Not a missed earnings drop (via Finnhub)
+  ✅ Not the result of a missed earnings drop
   ✅ VIX >= 15
-  ✅ No earnings within 2 days
-
-When triggered, pulls Yahoo Finance options chain and suggests
-best LEAPS contract: 400+ DTE, 70+ delta call.
 
 One alert per ticker per day.
 Sends to Telegram + Discord.
@@ -209,23 +205,6 @@ def check_missed_earnings(ticker):
         print(f"[{ticker}] Missed earn: {e}")
     return False, None
 
-def check_upcoming_earnings(ticker):
-    try:
-        url  = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
-        data = requests.get(url, headers=HEADERS, timeout=10).json()
-        earn = (data.get("quoteSummary", {}).get("result", [{}])[0]
-                    .get("calendarEvents", {}).get("earnings", {}).get("earningsDate", []))
-        today_d = datetime.utcnow().date()
-        for e in earn:
-            ts = e.get("raw")
-            if ts:
-                edate   = datetime.utcfromtimestamp(ts).date()
-                days_to = (edate - today_d).days
-                if 0 <= days_to <= EARNINGS_AVOID_DAYS:
-                    return True, str(edate)
-    except Exception as e:
-        print(f"[{ticker}] Upcoming earn: {e}")
-    return False, None
 
 def get_leaps_suggestion(ticker, current_price):
     try:
@@ -376,15 +355,6 @@ def run_screener():
             missed, miss_date = check_missed_earnings(ticker)
             if missed:
                 reason = f"missed earnings {miss_date}"
-                filtered.append({"ticker": ticker, "reason": reason, "time": now_str})
-                status_cache["filtered_today"].append({"ticker": ticker, "reason": reason})
-                alerted_today.add(ticker)
-                time.sleep(0.3)
-                continue
-
-            upcoming, earn_date = check_upcoming_earnings(ticker)
-            if upcoming:
-                reason = f"earnings in {EARNINGS_AVOID_DAYS}d ({earn_date})"
                 filtered.append({"ticker": ticker, "reason": reason, "time": now_str})
                 status_cache["filtered_today"].append({"ticker": ticker, "reason": reason})
                 alerted_today.add(ticker)
