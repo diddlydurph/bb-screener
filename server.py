@@ -209,85 +209,73 @@ def check_missed_earnings(ticker):
 def get_leaps_suggestion(ticker, current_price):
     try:
         import math
-
-        def estimate_delta(S, K, T, iv):
-            """Approximate delta using Black-Scholes d1."""
-            if iv is None or iv <= 0 or T <= 0:
-                return None
-            try:
-                d1 = (math.log(S / K) + (0.05 + 0.5 * iv ** 2) * T) / (iv * math.sqrt(T))
-                # Approximate N(d1) using logistic function
-                delta = 1 / (1 + math.exp(-1.7 * d1))
-                return round(delta, 2)
-            except Exception:
-                return None
-
         today_d    = datetime.utcnow().date()
         min_expiry = today_d + timedelta(days=MIN_DTE)
-        url  = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}"
-        data = requests.get(url, headers=HEADERS, timeout=10).json()
-        expirations = data.get("optionChain", {}).get("result", [{}])[0].get("expirationDates", [])
+
+        # Get options chain from marketdata.app
+        url = (
+            f"https://api.marketdata.app/v1/options/chain/{ticker}/"
+            f"?expiration_after={min_expiry.isoformat()}"
+            f"&option_type=call"
+            f"&delta_min={MIN_DELTA}"
+        )
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('MARKETDATA_KEY', 'aVk5Rjc5T0t3UFJsbkdpbWNWZXFweXFGRmN3VEFmYjdGbk0ybG5EejZzbz0')}",
+            "Accept": "application/json",
+        }
+        r    = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+
+        if data.get("s") != "ok" or not data.get("optionSymbol"):
+            print(f"[{ticker}] LEAPS: no data — {data.get('errmsg', 'unknown error')}")
+            return None
+
+        # Find best contract — highest delta with 400+ DTE
         best = None
+        symbols   = data.get("optionSymbol", [])
+        deltas    = data.get("delta", [])
+        strikes   = data.get("strike", [])
+        expiries  = data.get("expiration", [])
+        bids      = data.get("bid", [])
+        asks      = data.get("ask", [])
+        mids      = data.get("mid", [])
+        ivs       = data.get("iv", [])
+        dtes      = data.get("dte", [])
 
-        for exp_ts in expirations:
-            exp_date = datetime.utcfromtimestamp(exp_ts).date()
-            if exp_date < min_expiry:
+        for i in range(len(symbols)):
+            delta  = safe_float(deltas[i] if i < len(deltas) else None)
+            strike = safe_float(strikes[i] if i < len(strikes) else None)
+            dte    = safe_float(dtes[i] if i < len(dtes) else None)
+            bid    = safe_float(bids[i] if i < len(bids) else None)
+            ask    = safe_float(asks[i] if i < len(asks) else None)
+            mid    = safe_float(mids[i] if i < len(mids) else None)
+            iv     = safe_float(ivs[i] if i < len(ivs) else None)
+            expiry = expiries[i] if i < len(expiries) else None
+
+            if delta is None or strike is None or dte is None:
                 continue
-            dte  = (exp_date - today_d).days
-            T    = dte / 365.0  # time in years
+            if delta < MIN_DELTA:
+                continue
+            if dte < MIN_DTE:
+                continue
 
-            url2  = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}?date={exp_ts}"
-            data2 = requests.get(url2, headers=HEADERS, timeout=10).json()
-            calls = (data2.get("optionChain", {}).get("result", [{}])[0]
-                         .get("options", [{}])[0].get("calls", []))
-
-            for call in calls:
-                greeks = call.get("greeks") or {}
-                strike = safe_float(call.get("strike"))
-                bid    = safe_float(call.get("bid"))
-                ask    = safe_float(call.get("ask"))
-                iv     = safe_float(call.get("impliedVolatility"))
-                if strike is None:
-                    continue
-
-                # Try Yahoo delta first, fall back to BS estimate
-                delta = safe_float(call.get("delta") or greeks.get("delta"))
-                if delta is None and iv and iv > 0:
-                    delta = estimate_delta(current_price, strike, T, iv)
-
-                # If still no delta, skip deep OTM strikes (rough filter)
-                if delta is None:
-                    if strike > current_price * 1.15:
-                        continue
-                    delta = 0.70  # assume ITM strikes qualify
-
-                if delta < MIN_DELTA:
-                    continue
-
-                mid = round((bid + ask) / 2, 2) if bid and ask else None
-
-                if best is None or delta > best["delta"]:
-                    best = {
-                        "strike":  strike,
-                        "expiry":  exp_date.strftime("%d %b %Y"),
-                        "dte":     dte,
-                        "delta":   delta,
-                        "bid":     bid,
-                        "ask":     ask,
-                        "mid":     mid,
-                        "iv":      round(iv * 100, 1) if iv else None,
-                    }
-
-            if best:
-                break
-            time.sleep(0.3)
+            if best is None or delta > best["delta"]:
+                best = {
+                    "strike": strike,
+                    "expiry": expiry,
+                    "dte":    int(dte),
+                    "delta":  round(delta, 2),
+                    "bid":    bid,
+                    "ask":    ask,
+                    "mid":    mid,
+                    "iv":     round(iv * 100, 1) if iv else None,
+                }
 
         return best
 
     except Exception as e:
         print(f"[{ticker}] LEAPS: {e}")
         return None
-
 def check_volume_spike(volume, avg_vol):
     v, a = safe_float(volume, 0), safe_float(avg_vol, 0)
     if a == 0 or v == 0:
