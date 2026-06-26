@@ -454,6 +454,48 @@ def index():
         "<p><a href='/status'>Status</a> · <a href='/run'>Force scan</a> · <a href='/test'>Test</a></p>"
     ), 200
 
+@app.route("/debug/leaps/<ticker>")
+def debug_leaps(ticker):
+    import math
+    today_d    = datetime.utcnow().date()
+    min_expiry = today_d + timedelta(days=MIN_DTE)
+    try:
+        url  = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}"
+        data = requests.get(url, headers=HEADERS, timeout=10).json()
+        expirations = data.get("optionChain", {}).get("result", [{}])[0].get("expirationDates", [])
+        exp_dates = [datetime.utcfromtimestamp(e).date().isoformat() for e in expirations]
+        qualifying = [d for d in exp_dates if d >= min_expiry.isoformat()]
+
+        sample_calls = []
+        for exp_ts in expirations:
+            exp_date = datetime.utcfromtimestamp(exp_ts).date()
+            if exp_date < min_expiry:
+                continue
+            url2  = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}?date={exp_ts}"
+            data2 = requests.get(url2, headers=HEADERS, timeout=10).json()
+            calls = (data2.get("optionChain", {}).get("result", [{}])[0]
+                         .get("options", [{}])[0].get("calls", []))
+            for call in calls[:5]:
+                sample_calls.append({
+                    "strike": call.get("strike"),
+                    "bid":    call.get("bid"),
+                    "ask":    call.get("ask"),
+                    "delta":  call.get("delta"),
+                    "iv":     call.get("impliedVolatility"),
+                    "greeks": call.get("greeks"),
+                })
+            break
+
+        return jsonify({
+            "ticker":          ticker,
+            "all_expirations": exp_dates,
+            "qualifying_400d": qualifying,
+            "min_expiry":      min_expiry.isoformat(),
+            "sample_calls":    sample_calls,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/status")
 def status():
     return jsonify(status_cache), 200
@@ -477,5 +519,5 @@ def test():
 
 threading.Thread(target=screener_loop, daemon=True).start()
 
-if __name__ == "__main__":
+ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
