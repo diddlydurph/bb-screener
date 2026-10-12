@@ -9,5 +9,7 @@ services:
         sync: false
       - key: TG_CHAT_ID
         sync: false
+      - key: MARKETDATA_KEY
+        sync: false
       - key: CHECK_INTERVAL
         value: "900"

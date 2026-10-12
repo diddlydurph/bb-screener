@@ -212,6 +212,11 @@ def get_leaps_suggestion(ticker, current_price):
         today_d    = datetime.utcnow().date()
         min_expiry = today_d + timedelta(days=MIN_DTE)
 
+        key = os.environ.get('MARKETDATA_KEY', '')
+        if not key:
+            print(f"[{ticker}] LEAPS: MARKETDATA_KEY not set, skipping")
+            return None
+
         # Get options chain from marketdata.app
         url = (
             f"https://api.marketdata.app/v1/options/chain/{ticker}/"
@@ -220,7 +225,7 @@ def get_leaps_suggestion(ticker, current_price):
             f"&delta_min={MIN_DELTA}"
         )
         headers = {
-            "Authorization": f"Bearer {os.environ.get('MARKETDATA_KEY', 'aVk5Rjc5T0t3UFJsbkdpbWNWZXFweXFGRmN3VEFmYjdGbk0ybG5EejZzbz0')}",
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
         }
         r    = requests.get(url, headers=headers, timeout=15)
