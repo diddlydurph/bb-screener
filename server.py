@@ -1,6 +1,6 @@
 """
-BB Touch Screener — Intraday with LEAPS Suggestions
------------------------------------------------------
+BB Touch Screener — Intraday
+----------------------------
 Alerts when:
   ✅ Price touches lower BB (20, 2) intraday
      (or mid-BB if beta > 2.2)
@@ -9,6 +9,9 @@ Alerts when:
 
 One alert per ticker per day.
 Sends to Telegram + Discord.
+
+LEAPS suggestions were removed in Oct 2026; Trading System V2 replaces them.
+/debug/leaps still lists 400+ DTE expiries from Yahoo.
 """
 
 import os
@@ -32,7 +35,6 @@ VIX_THRESHOLD   = float(os.environ.get("VIX_THRESHOLD", "15.0"))
 HIGH_BETA_THRESHOLD = float(os.environ.get("HIGH_BETA_THRESHOLD", "2.2"))
 EARNINGS_AVOID_DAYS = int(os.environ.get("EARNINGS_AVOID_DAYS", "2"))
 MIN_DTE         = int(os.environ.get("MIN_DTE", "400"))
-MIN_DELTA       = float(os.environ.get("MIN_DELTA", "0.70"))
 
 WATCHLIST = [
     "SPY", "QQQ", "HOOD", "PLTR", "SOFI", "KTOS", "IREN",
@@ -206,82 +208,29 @@ def check_missed_earnings(ticker):
     return False, None
 
 
-def get_leaps_suggestion(ticker, current_price):
-    try:
-        import math
-        today_d    = datetime.utcnow().date()
-        min_expiry = today_d + timedelta(days=MIN_DTE)
-
-        # Get options chain from marketdata.app
-        url = (
-            f"https://api.marketdata.app/v1/options/chain/{ticker}/"
-            f"?expiration_after={min_expiry.isoformat()}"
-            f"&option_type=call"
-            f"&delta_min={MIN_DELTA}"
-        )
-        headers = {
-            "Authorization": f"Bearer {os.environ.get('MARKETDATA_KEY', 'aVk5Rjc5T0t3UFJsbkdpbWNWZXFweXFGRmN3VEFmYjdGbk0ybG5EejZzbz0')}",
-            "Accept": "application/json",
-        }
-        r    = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
-
-        if data.get("s") != "ok" or not data.get("optionSymbol"):
-            print(f"[{ticker}] LEAPS: no data — {data.get('errmsg', 'unknown error')}")
-            return None
-
-        # Find best contract — highest delta with 400+ DTE
-        best = None
-        symbols   = data.get("optionSymbol", [])
-        deltas    = data.get("delta", [])
-        strikes   = data.get("strike", [])
-        expiries  = data.get("expiration", [])
-        bids      = data.get("bid", [])
-        asks      = data.get("ask", [])
-        mids      = data.get("mid", [])
-        ivs       = data.get("iv", [])
-        dtes      = data.get("dte", [])
-
-        for i in range(len(symbols)):
-            delta  = safe_float(deltas[i] if i < len(deltas) else None)
-            strike = safe_float(strikes[i] if i < len(strikes) else None)
-            dte    = safe_float(dtes[i] if i < len(dtes) else None)
-            bid    = safe_float(bids[i] if i < len(bids) else None)
-            ask    = safe_float(asks[i] if i < len(asks) else None)
-            mid    = safe_float(mids[i] if i < len(mids) else None)
-            iv     = safe_float(ivs[i] if i < len(ivs) else None)
-            expiry = expiries[i] if i < len(expiries) else None
-
-            if delta is None or strike is None or dte is None:
-                continue
-            if delta < MIN_DELTA:
-                continue
-            if dte < MIN_DTE:
-                continue
-
-            if best is None or delta > best["delta"]:
-                best = {
-                    "strike": strike,
-                    "expiry": expiry,
-                    "dte":    int(dte),
-                    "delta":  round(delta, 2),
-                    "bid":    bid,
-                    "ask":    ask,
-                    "mid":    mid,
-                    "iv":     round(iv * 100, 1) if iv else None,
-                }
-
-        return best
-
-    except Exception as e:
-        print(f"[{ticker}] LEAPS: {e}")
-        return None
 def check_volume_spike(volume, avg_vol):
     v, a = safe_float(volume, 0), safe_float(avg_vol, 0)
     if a == 0 or v == 0:
         return False, 0.0
     m = v / a
     return m >= VOLUME_SPIKE_MULTIPLE, round(m, 1)
+
+def build_alert_message(t, now_str):
+    vix_tick = "✅" if t["vix_ok"] else "❌"
+    return (
+        f"🔔 <b>BB Touch Alert</b>{t['vol_warn']}\n\n"
+        f"<b>{t['ticker']}</b>  β={t['beta']}\n"
+        f"Entry: <i>{t['entry_type']}</i>\n\n"
+        f"💰 Price:    <code>{t['price']}</code>\n"
+        f"📉 Lower BB: <code>{t['lower']}</code>\n"
+        f"〰️ Mid BB:   <code>{t['basis']}</code>\n"
+        f"📏 % from lower: <code>{t['pct']:+.2f}%</code>\n\n"
+        f"<b>Criteria</b>\n"
+        f"✅ Lower BB touched\n"
+        f"✅ Not a missed earnings drop\n"
+        f"{vix_tick} VIX {'>=' if t['vix_ok'] else '<'} {VIX_THRESHOLD} (currently {t['vix']})\n\n"
+        f"🕐 {now_str}"
+    )
 
 def run_screener():
     global alerted_today, last_alert_date
@@ -353,14 +302,11 @@ def run_screener():
             vol_warn = f" ⚠️ Vol {vol_mult}x avg" if is_spike else ""
             pct      = round((price - bb["lower"]) / bb["lower"] * 100, 2)
 
-            print(f"    📊 Fetching LEAPS for {ticker}…")
-            leaps = get_leaps_suggestion(ticker, price)
-
             touches.append({
                 "ticker": ticker, "price": price, "lower": bb["lower"],
                 "basis": bb["basis"], "pct": pct, "vol_warn": vol_warn,
                 "vix": vix_str, "vix_ok": vix_ok, "entry_type": entry_type,
-                "beta": beta_disp, "leaps": leaps,
+                "beta": beta_disp,
             })
             alerted_today.add(ticker)
 
@@ -370,38 +316,7 @@ def run_screener():
         time.sleep(0.3)
 
     for t in touches:
-        vix_tick = "✅" if t["vix_ok"] else "❌"
-        if t["leaps"]:
-            l = t["leaps"]
-            mid_str = f"${l['mid']:.2f}" if l["mid"] else "—"
-            iv_str  = f"{l['iv']}%" if l["iv"] else "—"
-            leaps_block = (
-                f"\n\n📋 <b>Suggested LEAPS Entry</b>\n"
-                f"Strike:  <code>{l['strike']}</code>\n"
-                f"Expiry:  <code>{l['expiry']}</code> ({l['dte']} DTE)\n"
-                f"Delta:   <code>{l['delta']}</code>\n"
-                f"Mid:     <code>{mid_str}</code>\n"
-                f"Bid/Ask: <code>${l['bid']} / ${l['ask']}</code>\n"
-                f"IV:      <code>{iv_str}</code>"
-            )
-        else:
-            leaps_block = "\n\n📋 <b>LEAPS:</b> No qualifying contract found (400+ DTE, 70+ delta)"
-
-        msg = (
-            f"🔔 <b>BB Touch Alert</b>{t['vol_warn']}\n\n"
-            f"<b>{t['ticker']}</b>  β={t['beta']}\n"
-            f"Entry: <i>{t['entry_type']}</i>\n\n"
-            f"💰 Price:    <code>{t['price']}</code>\n"
-            f"📉 Lower BB: <code>{t['lower']}</code>\n"
-            f"〰️ Mid BB:   <code>{t['basis']}</code>\n"
-            f"📏 % from lower: <code>{t['pct']:+.2f}%</code>\n\n"
-            f"<b>Criteria</b>\n"
-            f"✅ Lower BB touched\n"
-            f"✅ Not a missed earnings drop\n"
-            f"{vix_tick} VIX {'>=' if t['vix_ok'] else '<'} {VIX_THRESHOLD} (currently {t['vix']})"
-            f"{leaps_block}\n\n"
-            f"🕐 {now_str}"
-        )
+        msg = build_alert_message(t, now_str)
         send_alert(msg)
         status_cache["alerts_today"].append({"ticker": t["ticker"], "time": now_str, "price": t["price"]})
         print(f"  ✅ Alert sent for {t['ticker']}")
@@ -433,7 +348,7 @@ def screener_loop():
 @app.route("/")
 def index():
     return (
-        "<h2>BB Screener — Intraday + LEAPS</h2>"
+        "<h2>BB Screener — Intraday</h2>"
         f"<p>Watching <b>{len(WATCHLIST)} tickers</b> · "
         f"Last run: <b>{status_cache['last_run'] or 'not yet'}</b> · "
         f"Market open: <b>{status_cache['market_open']}</b></p>"
@@ -496,10 +411,9 @@ def force_run():
 @app.route("/test")
 def test():
     send_alert(
-        f"✅ <b>BB Screener — Intraday + LEAPS</b>\n\n"
+        f"✅ <b>BB Screener — Intraday</b>\n\n"
         f"Watching <b>{len(WATCHLIST)} tickers</b>.\n"
         f"VIX threshold: {VIX_THRESHOLD} · High beta threshold: {HIGH_BETA_THRESHOLD}\n"
-        f"LEAPS: {MIN_DTE}+ DTE, {int(MIN_DELTA*100)}+ delta\n"
         f"Earnings avoid window: {EARNINGS_AVOID_DAYS} days\n"
         f"Scans every 15 min · 09:30–16:00 ET"
     )
